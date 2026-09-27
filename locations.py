@@ -34,7 +34,12 @@ PINCODES = {
 SPECIALTY_SEARCH_TERMS = [
     "cardiologist", "dermatologist", "orthopedic doctor", "gynecologist",
     "pediatrician", "ent specialist", "dentist", "psychiatrist",
-    "urologist", "general physician",
+    "urologist", "diabetologist", "gastroenterologist", "neurologist",
+    "ophthalmologist", "nephrologist", "pulmonologist", "oncologist",
+    "endocrinologist", "rheumatologist", "sexologist", "psychologist",
+    "physiotherapist", "homeopathy doctor", "ayurvedic doctor",
+    "dietitian nutritionist", "cosmetic surgeon", "general surgeon",
+    "ivf specialist", "proctologist", "general physician",
 ]
 GENERAL_FALLBACK_TERM = "doctors"
 
