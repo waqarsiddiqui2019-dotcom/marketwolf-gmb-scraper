@@ -55,7 +55,7 @@ from email_finder import find_email
 WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwFx_9J6geeA38SMdF5QFZ4jbkZzRzKIZ-00cELpARAbhXE3k6mP4z66H_z52QEgKV8/exec"
 SECRET = "marketwolf-leads-2026"
 
-DAILY_LEAD_TARGET = 120
+DAILY_LEAD_TARGET = 200
 # High enough that it never fires before Google's own infinite-scroll limit
 # does (Maps typically stops adding new cards well before this on a single
 # search) - "all doctors in this pincode", not "first 30".

@@ -27,7 +27,7 @@ in this repo needs to track that - just run the script.
    ```
 
 2. Run the scraper with its defaults (Doctors niche, stops automatically
-   after 120 new leads or one full lap of the grid, whichever comes first):
+   after 200 new leads or one full lap of the grid, whichever comes first):
    ```
    python gmb_scraper.py
    ```

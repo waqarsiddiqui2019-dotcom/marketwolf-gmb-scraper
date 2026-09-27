@@ -2,21 +2,21 @@
 # works through every pincode in a city (ascending, starting 400001 in
 # Mumbai) before moving to the next city, so "all doctors in this area"
 # means "all doctors in this pincode" rather than a rougher named locality.
-# Pincodes below are real, verified codes (not a blind 400001-400104 sweep,
-# which would waste queries on unassigned numbers) - Mumbai's are the
-# official 37 assigned Mumbai-district codes; Navi Mumbai/Thane are the
-# codes for the same localities the original neighborhood-based version
-# covered.
+#
+# Mumbai uses the FULL sequential 400001-400104 range rather than a
+# hand-picked "valid" subset - an earlier curated list (built from a postal
+# lookup search) turned out to be missing real, assigned codes (400083,
+# 400086, etc), so completeness now wins over trimming a handful of
+# unassigned numbers. A pincode with no post office just returns few/no
+# Google Maps results - harmless, not an error.
+#
+# Navi Mumbai/Thane are the codes for the same localities the original
+# neighborhood-based version covered. Kalyan-Dombivli (421xxx prefix, a
+# separate municipal corporation from Thane) is its own city group appended
+# after Thane.
 
 PINCODES = {
-    "Mumbai": [
-        "400001", "400003", "400004", "400005", "400007", "400009", "400011",
-        "400012", "400020", "400022", "400028", "400029", "400030", "400037",
-        "400042", "400050", "400051", "400053", "400058", "400065", "400066",
-        "400067", "400069", "400071", "400074", "400075", "400078", "400082",
-        "400084", "400085", "400089", "400091", "400092", "400093", "400094",
-        "400099", "400104",
-    ],
+    "Mumbai": [f"4000{n:02d}" if n < 100 else f"400{n}" for n in range(1, 105)],
     "Navi Mumbai": [
         "400614", "400703", "400706", "400708", "400710", "410206", "410209",
         "410210",
@@ -24,6 +24,9 @@ PINCODES = {
     "Thane": [
         "400601", "400602", "400604", "400605", "400606", "400607", "400612",
         "400615",
+    ],
+    "Kalyan-Dombivli": [
+        "421201", "421202", "421203", "421204", "421301", "421304", "421306",
     ],
 }
 
