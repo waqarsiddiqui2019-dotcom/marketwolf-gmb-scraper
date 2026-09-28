@@ -30,8 +30,8 @@ PINCODES = {
     ],
 }
 
-# Specialized doctors only - no generic "doctors" catch-all search. Every
-# pincode is searched once per specialty below, in this order.
+# Mostly specialized doctors. Every pincode is searched once per specialty
+# below, in this order.
 SPECIALTY_SEARCH_TERMS = [
     "cardiologist", "dermatologist", "orthopedic doctor", "gynecologist",
     "pediatrician", "ent specialist", "dentist", "psychiatrist",
@@ -43,6 +43,13 @@ SPECIALTY_SEARCH_TERMS = [
     "ivf specialist", "proctologist", "general physician",
 ]
 GENERAL_FALLBACK_TERM = "doctors"
+
+# KPI experiment: 1 in 5 pincodes (20%) also gets a generic "doctors" search
+# after its specialty searches, to test whether the broad catch-all turns up
+# leads the specific specialty searches miss (e.g. small multi-specialty or
+# unlabeled clinics). The other 4 in 5 stay specialty-only. If the generic
+# search's results prove worthwhile, this ratio can be raised later.
+GENERAL_SEARCH_EVERY_NTH_PINCODE = 5
 
 
 def build_queries(search_term):
@@ -57,12 +64,19 @@ def build_priority_queries():
     """
     Yields (city, pincode, specialty_term, query_string) for the FULL daily
     grid: for each pincode, every specialty term (in SPECIALTY_SEARCH_TERMS
-    order) is queried - no generic "doctors" catch-all, specialized only -
-    then the run moves to the next pincode.
+    order) is queried, then - for 1 in every GENERAL_SEARCH_EVERY_NTH_PINCODE
+    pincodes (20%) - one extra generic "doctors" search for that same
+    pincode, as a running KPI test of whether it's worth keeping.
     """
-    all_terms = SPECIALTY_SEARCH_TERMS
+    pincode_counter = 0
     for city, pincodes in PINCODES.items():
         for pincode in pincodes:
-            for term in all_terms:
+            for term in SPECIALTY_SEARCH_TERMS:
                 query = f"{term} near {pincode} {city}"
                 yield city, pincode, term, query
+
+            if pincode_counter % GENERAL_SEARCH_EVERY_NTH_PINCODE == 0:
+                query = f"{GENERAL_FALLBACK_TERM} near {pincode} {city}"
+                yield city, pincode, GENERAL_FALLBACK_TERM, query
+
+            pincode_counter += 1
