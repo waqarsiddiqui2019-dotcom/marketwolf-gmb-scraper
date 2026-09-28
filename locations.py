@@ -30,10 +30,8 @@ PINCODES = {
     ],
 }
 
-# Priority order: specific specialties are searched first in every pincode,
-# "doctors" (the broadest catch-all) always runs last - so a day's run that
-# gets cut off by the lead target still has specialists over-represented
-# relative to generic listings, per how leads should be prioritized.
+# Specialized doctors only - no generic "doctors" catch-all search. Every
+# pincode is searched once per specialty below, in this order.
 SPECIALTY_SEARCH_TERMS = [
     "cardiologist", "dermatologist", "orthopedic doctor", "gynecologist",
     "pediatrician", "ent specialist", "dentist", "psychiatrist",
@@ -58,11 +56,11 @@ def build_queries(search_term):
 def build_priority_queries():
     """
     Yields (city, pincode, specialty_term, query_string) for the FULL daily
-    grid, in priority order: for each pincode, every specialty term (in
-    SPECIALTY_SEARCH_TERMS order) is queried before the general "doctors"
-    fallback for that same pincode - then the run moves to the next pincode.
+    grid: for each pincode, every specialty term (in SPECIALTY_SEARCH_TERMS
+    order) is queried - no generic "doctors" catch-all, specialized only -
+    then the run moves to the next pincode.
     """
-    all_terms = SPECIALTY_SEARCH_TERMS + [GENERAL_FALLBACK_TERM]
+    all_terms = SPECIALTY_SEARCH_TERMS
     for city, pincodes in PINCODES.items():
         for pincode in pincodes:
             for term in all_terms:
