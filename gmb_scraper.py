@@ -47,7 +47,7 @@ import re
 import sys
 
 import httpx
-from playwright.async_api import async_playwright
+from scrapling.fetchers import AsyncStealthySession
 
 from locations import build_priority_queries, build_queries, GENERAL_FALLBACK_TERM
 from email_finder import find_email
@@ -55,7 +55,59 @@ from email_finder import find_email
 WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwFx_9J6geeA38SMdF5QFZ4jbkZzRzKIZ-00cELpARAbhXE3k6mP4z66H_z52QEgKV8/exec"
 SECRET = "marketwolf-leads-2026"
 
-DAILY_LEAD_TARGET = 250
+# Google's result-list cards never include the listing's real pincode (only
+# the full detail page does), so without this every lead was tagged with
+# whichever pincode happened to be SEARCHED - wrong whenever Google's
+# radius-based "near <pincode>" search pulled in a business from a
+# neighbouring pincode (discovered 2026-10-01: e.g. a lead actually in 400086
+# was labelled 400001 because that's what the search grid was on). Instead,
+# pull the lat/lng Google Maps already embeds in the listing's own link and
+# reverse-geocode that to the true pincode via Nominatim (OSM) - free, no API
+# key, but its usage policy caps public requests at 1/sec, so calls are
+# serialized through _last_geocode_at.
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
+NOMINATIM_HEADERS = {"User-Agent": "marketwolf-gmb-scraper/1.0 (+https://marketwolf.pro)"}
+_last_geocode_at = 0.0
+_geocode_lock = asyncio.Lock()
+
+
+def extract_coords(gmb_link: str | None):
+    """Lat/lng Google Maps embeds in its own listing links. Checked two formats
+    actually seen from these links: the place-page '...!3d<lat>!4d<lng>!...'
+    (what card hrefs here actually produce) and the generic map-view '/@lat,lng,zoom'."""
+    if not gmb_link:
+        return None
+    m = re.search(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)", gmb_link)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    m = re.search(r"/@(-?\d+\.\d+),(-?\d+\.\d+)", gmb_link)
+    if not m:
+        return None
+    return float(m.group(1)), float(m.group(2))
+
+
+async def reverse_geocode_pincode(client: httpx.AsyncClient, lat: float, lng: float) -> str | None:
+    """True postal code for a lat/lng, via Nominatim. None on any failure - caller falls back."""
+    global _last_geocode_at
+    async with _geocode_lock:
+        wait = _last_geocode_at + 1.1 - asyncio.get_event_loop().time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_geocode_at = asyncio.get_event_loop().time()
+    try:
+        resp = await client.get(
+            NOMINATIM_URL,
+            params={"format": "jsonv2", "lat": lat, "lon": lng, "zoom": 18, "addressdetails": 1},
+            headers=NOMINATIM_HEADERS,
+            timeout=10.0,
+        )
+        data = resp.json()
+        pincode = (data.get("address") or {}).get("postcode")
+        return pincode.strip() if pincode and re.match(r"^\d{6}$", pincode.strip()) else None
+    except Exception:
+        return None
+
+DAILY_LEAD_TARGET = 100
 # High enough that it never fires before Google's own infinite-scroll limit
 # does (Maps typically stops adding new cards well before this on a single
 # search) - "all doctors in this pincode", not "first 30".
@@ -161,39 +213,59 @@ async def post_lead(client: httpx.AsyncClient, lead: dict):
         print(f"  ! Failed to post lead {lead.get('name')}: {e}")
 
 
-async def scrape_query(page, city, pincode, term, query, niche, seen_phones_global, http_client):
+async def scrape_query(session, city, pincode, term, query, niche, seen_phones_global, http_client):
     url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
     print(f"\n[{city} / {pincode} / {term}] {url}")
 
+    # All the real browser automation (scroll-until-stagnant, then extract)
+    # happens here via Scrapling's page_action, which hands us the same
+    # Playwright `page` object this used to drive directly - so the actual
+    # scrolling/extraction logic is unchanged from the raw-Playwright version.
+    # Results are captured via this closure since page_action itself has no
+    # return path back to the caller.
+    captured = {"raw_results": None, "blocked": False}
+
+    async def automate(page):
+        try:
+            await page.wait_for_selector('div[role="feed"]', timeout=10000)
+        except Exception as e:
+            print(f"  ! Could not load results (possibly blocked): {e}")
+            return
+
+        content = await page.content()
+        if "unusual traffic" in content.lower() or "recaptcha" in content.lower():
+            print("  !!! BLOCKED: Google is showing a CAPTCHA / unusual-traffic wall. Stopping this run. !!!")
+            captured["blocked"] = True
+            return
+
+        prev_count = 0
+        stagnant = 0
+        while stagnant < MAX_STAGNANT_SCROLLS:
+            cards = await page.query_selector_all('div[role="feed"] div[role="article"]')
+            count = len(cards)
+            if count >= MAX_RESULTS_PER_QUERY:
+                break
+            stagnant = stagnant + 1 if count == prev_count else 0
+            prev_count = count
+            await page.evaluate("""
+                () => { const f = document.querySelector('div[role="feed"]'); if (f) f.scrollTop = f.scrollHeight; }
+            """)
+            await page.wait_for_timeout(SCROLL_WAIT_MS)
+
+        captured["raw_results"] = await page.evaluate(EXTRACT_JS)
+
     try:
-        await page.goto(url, timeout=NAV_TIMEOUT_MS)
-        await page.wait_for_timeout(3000)
-        await page.wait_for_selector('div[role="feed"]', timeout=10000)
+        await session.fetch(url, page_action=automate, timeout=NAV_TIMEOUT_MS)
     except Exception as e:
         print(f"  ! Could not load results (possibly blocked): {e}")
         return 0
 
-    content = await page.content()
-    if "unusual traffic" in content.lower() or "recaptcha" in content.lower():
-        print("  !!! BLOCKED: Google is showing a CAPTCHA / unusual-traffic wall. Stopping this run. !!!")
+    if captured["blocked"]:
         raise RuntimeError("BLOCKED_BY_GOOGLE")
+    if not captured["raw_results"]:
+        return 0
 
-    prev_count = 0
-    stagnant = 0
-    while stagnant < MAX_STAGNANT_SCROLLS:
-        cards = await page.query_selector_all('div[role="feed"] div[role="article"]')
-        count = len(cards)
-        if count >= MAX_RESULTS_PER_QUERY:
-            break
-        stagnant = stagnant + 1 if count == prev_count else 0
-        prev_count = count
-        await page.evaluate("""
-            () => { const f = document.querySelector('div[role="feed"]'); if (f) f.scrollTop = f.scrollHeight; }
-        """)
-        await page.wait_for_timeout(SCROLL_WAIT_MS)
-
-    raw_results = await page.evaluate(EXTRACT_JS)
-    raw_results = raw_results[:MAX_RESULTS_PER_QUERY]
+    raw_results = captured["raw_results"][:MAX_RESULTS_PER_QUERY]
 
     new_count = 0
     query_seen_gmb = set()
@@ -219,8 +291,14 @@ async def scrape_query(page, city, pincode, term, query, niche, seen_phones_glob
         website = r.get("website")
         email = await find_email(website, http_client) if website else None
 
+        coords = extract_coords(gmb_link)
+        real_pincode = await reverse_geocode_pincode(http_client, *coords) if coords else None
+        location = f"{city} - {real_pincode}" if real_pincode else f"{city} - {pincode}"
+        if real_pincode and real_pincode != pincode:
+            print(f"  (real pincode {real_pincode}, not searched {pincode})")
+
         lead = {
-            "location": f"{city} - {pincode}",
+            "location": location,
             "name": r.get("name") or "",
             "phone": r.get("phone") or "",
             "email": email or "",
@@ -278,40 +356,43 @@ async def main():
     steps_taken = 0
 
     async with httpx.AsyncClient() as http_client:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-                viewport={"width": 1366, "height": 900},
-                locale="en-IN",
-            )
-            page = await context.new_page()
+        # StealthyFetcher/AsyncStealthySession (patchright under the hood) in
+        # place of raw Playwright - same automation (page_action still gets
+        # the real Playwright `page`), but with realistic fingerprints, canvas
+        # noise, WebRTC/CDP-leak patches, etc. to reduce the chance of Google's
+        # CAPTCHA/"unusual traffic" wall in the first place. max_pages=1 since
+        # queries are still run one at a time, matching the old single-page
+        # behaviour the resume cursor / politeness delay assume.
+        async with AsyncStealthySession(
+            headless=True,
+            max_pages=1,
+            block_webrtc=True,
+            useragent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            locale="en-IN",
+            extra_flags=["--disable-gpu", "--disable-dev-shm-usage"],
+        ) as session:
+            # Bounded by len(grid) so a niche that's fully out of new
+            # leads (everything already scraped) can't spin forever -
+            # one full lap without hitting the target just ends the run.
+            for _ in range(len(grid)):
+                if total_new >= args.daily_target:
+                    break
 
-            try:
-                # Bounded by len(grid) so a niche that's fully out of new
-                # leads (everything already scraped) can't spin forever -
-                # one full lap without hitting the target just ends the run.
-                for _ in range(len(grid)):
-                    if total_new >= args.daily_target:
+                city, pincode, term, query = grid[cursor]
+                try:
+                    new_count = await scrape_query(session, city, pincode, term, query, args.niche, seen_phones, http_client)
+                    total_new += new_count
+                except RuntimeError as e:
+                    if str(e) == "BLOCKED_BY_GOOGLE":
+                        print("\nStopping entire run - Google has blocked this session.")
+                        blocked = True
                         break
+                    raise
 
-                    city, pincode, term, query = grid[cursor]
-                    try:
-                        new_count = await scrape_query(page, city, pincode, term, query, args.niche, seen_phones, http_client)
-                        total_new += new_count
-                    except RuntimeError as e:
-                        if str(e) == "BLOCKED_BY_GOOGLE":
-                            print("\nStopping entire run - Google has blocked this session.")
-                            blocked = True
-                            break
-                        raise
-
-                    cursor = (cursor + 1) % len(grid)
-                    steps_taken += 1
-                    await set_scraper_cursor(http_client, args.niche, cursor)
-                    await page.wait_for_timeout(2500)  # be a little polite between queries
-            finally:
-                await browser.close()
+                cursor = (cursor + 1) % len(grid)
+                steps_taken += 1
+                await set_scraper_cursor(http_client, args.niche, cursor)
+                await asyncio.sleep(2.5)  # be a little polite between queries
 
     if total_new > 0:
         await sort_sheet_by_location()
