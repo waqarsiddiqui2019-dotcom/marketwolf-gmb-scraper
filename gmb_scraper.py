@@ -213,6 +213,47 @@ async def post_lead(client: httpx.AsyncClient, lead: dict):
         print(f"  ! Failed to post lead {lead.get('name')}: {e}")
 
 
+# Google Maps list cards stopped showing phone numbers (2026-10-02) - the
+# number is only on each place's own page. Fallback: open the place page and
+# read the phone button. Only used for cards whose Google category matches
+# --category-keywords (if given), to keep page loads down.
+DETAIL_PHONE_JS = """() => {
+  const b = document.querySelector('button[data-item-id^="phone:tel:"]');
+  return b ? b.getAttribute('data-item-id').replace('phone:tel:', '') : null;
+}"""
+CATEGORY_KEYWORDS: list = []
+_detail_seen_links: set = set()
+
+
+async def fetch_phone_from_detail(session, gmb_link):
+    if not gmb_link or gmb_link in _detail_seen_links:
+        return None
+    _detail_seen_links.add(gmb_link)
+    captured = {"phone": None}
+
+    async def act(page):
+        try:
+            await page.wait_for_selector("h1", timeout=10000)
+            await page.wait_for_timeout(1200)
+            captured["phone"] = await page.evaluate(DETAIL_PHONE_JS)
+        except Exception:
+            pass
+
+    try:
+        await session.fetch(gmb_link, page_action=act, timeout=30000)
+    except Exception as e:
+        print(f"  ! detail page failed: {e}")
+    await asyncio.sleep(2.0)
+    return captured["phone"]
+
+
+def category_matches(card_category: str) -> bool:
+    if not CATEGORY_KEYWORDS:
+        return True
+    c = (card_category or "").lower()
+    return any(k in c for k in CATEGORY_KEYWORDS)
+
+
 async def scrape_query(session, city, pincode, term, query, niche, seen_phones_global, http_client):
     url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
     print(f"\n[{city} / {pincode} / {term}] {url}")
@@ -278,6 +319,13 @@ async def scrape_query(session, city, pincode, term, query, niche, seen_phones_g
 
         phone_norm = normalize_phone(r.get("phone"))
         if not phone_norm:
+            card_cat, _ = split_category_address(r.get("categoryAddress") or "")
+            if category_matches(card_cat):
+                detail_phone = await fetch_phone_from_detail(session, gmb_link)
+                if detail_phone:
+                    r["phone"] = detail_phone
+                    phone_norm = normalize_phone(detail_phone)
+        if not phone_norm:
             continue  # no phone = not usable as a lead
         if phone_norm in seen_phones_global:
             continue  # already in the sheet from a previous run, or seen earlier this run
@@ -326,6 +374,12 @@ def parse_args():
                          help='Google Maps search phrase for non-Doctors niches, e.g. "veterinary clinic", "salon" (ignored for Doctors, which uses the specialty-priority list instead)')
     parser.add_argument("--daily-target", type=int, default=DAILY_LEAD_TARGET,
                          help=f"Stop once this many new leads have been sent (default: {DAILY_LEAD_TARGET})")
+    parser.add_argument("--category-keywords", default="",
+                         help="Comma-separated, case-insensitive; only open detail pages (for phone) of cards whose Google category contains one of these")
+    parser.add_argument("--start-index", type=int, default=None,
+                         help="Grid index to resume from, overriding the remote (Sheet-persisted) cursor. "
+                              "Use when the remote cursor isn't persisting reliably - the local "
+                              "cursor_<niche>.txt file (written after every step) gives the value to pass here.")
     return parser.parse_args()
 
 
@@ -335,17 +389,30 @@ def build_grid(args):
     any other niche."""
     if args.niche == "Doctors":
         return list(build_priority_queries())
-    return [(city, pincode, args.search_term, query) for city, pincode, query in build_queries(args.search_term)]
+    # --search-term may be comma-separated ("interior designer,interior decorator"):
+    # the grid interleaves the terms per pincode so every area gets all of them
+    # before moving on, instead of finishing one term across the whole city first.
+    terms = [t.strip() for t in args.search_term.split(",") if t.strip()]
+    per_term = [[(city, pincode, t, query) for city, pincode, query in build_queries(t)] for t in terms]
+    return [row for group in zip(*per_term) for row in group]
 
 
 async def main():
     args = parse_args()
+    CATEGORY_KEYWORDS[:] = [k.strip().lower() for k in args.category_keywords.split(",") if k.strip()]
     print(f"Niche: {args.niche} | Daily target: {args.daily_target} leads")
 
     grid = build_grid(args)
-    cursor = await get_scraper_cursor(args.niche)
+    if args.start_index is not None:
+        cursor = args.start_index
+        print(f"Using --start-index override ({cursor}) instead of the remote cursor.")
+    else:
+        cursor = await get_scraper_cursor(args.niche)
     cursor = cursor % len(grid)
     print(f"Grid has {len(grid)} pincode+term combinations. Resuming from index {cursor}.")
+
+    niche_slug = re.sub(r"[^a-zA-Z0-9]+", "_", args.niche).strip("_").lower()
+    local_cursor_file = f"cursor_{niche_slug}.txt"
 
     print("Fetching already-recorded phone numbers from the sheet for dedup...")
     seen_phones = await fetch_existing_phones()
@@ -392,6 +459,11 @@ async def main():
                 cursor = (cursor + 1) % len(grid)
                 steps_taken += 1
                 await set_scraper_cursor(http_client, args.niche, cursor)
+                try:
+                    with open(local_cursor_file, "w") as f:
+                        f.write(str(cursor))
+                except Exception as e:
+                    print(f"  ! could not write local cursor file: {e}", file=sys.stderr)
                 await asyncio.sleep(2.5)  # be a little polite between queries
 
     if total_new > 0:

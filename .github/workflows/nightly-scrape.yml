@@ -1,0 +1,61 @@
+name: Nightly scrape
+
+# Runs at 00:00 IST (18:30 UTC) so fresh leads are in the CRM before the
+# 10 AM IST WhatsApp window opens. Each niche is its own job; the grid cursor
+# is committed back to the repo so tomorrow continues where tonight stopped.
+on:
+  schedule:
+    - cron: "30 18 * * *"
+  workflow_dispatch:
+    inputs:
+      daily_target:
+        description: "New leads per niche (default 1000)"
+        default: "1000"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-scrape-${{ matrix.niche_slug }}
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - niche_slug: doctors
+            args: '--niche Doctors'
+          - niche_slug: interior_designers
+            args: '--niche "Interior Designers" --search-term "interior designer,interior decorator,modular kitchen" --category-keywords "interior,decorator,modular kitchen,architect,renovation,designer"'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          scrapling install
+      - name: Scrape
+        run: |
+          TARGET="${{ github.event.inputs.daily_target || '1000' }}"
+          START=""
+          if [ -f "cursor_${{ matrix.niche_slug }}.txt" ]; then START="--start-index $(cat cursor_${{ matrix.niche_slug }}.txt)"; fi
+          eval python -u gmb_scraper.py ${{ matrix.args }} --daily-target "$TARGET" $START 2>&1 | tee scrape_${{ matrix.niche_slug }}.log
+      - name: Save cursor
+        if: always()
+        run: |
+          git config user.name "scraper-bot"; git config user.email "scraper-bot@users.noreply.github.com"
+          git add cursor_*.txt || true
+          git diff --cached --quiet && exit 0
+          git commit -m "Update ${{ matrix.niche_slug }} cursor"
+          for i in 1 2 3 4 5; do git pull --rebase -q && git push -q && break; sleep $((RANDOM % 10 + 3)); done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-${{ matrix.niche_slug }}
+          path: scrape_*.log
