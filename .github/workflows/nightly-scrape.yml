@@ -6,6 +6,8 @@ name: Nightly scrape
 on:
   schedule:
     - cron: "30 18 * * *"
+  push:
+    paths: ["trigger-test.txt"]   # edit this file to fire a small test run without the GitHub UI
   workflow_dispatch:
     inputs:
       daily_target:
@@ -15,14 +17,17 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: nightly-scrape-${{ matrix.niche_slug }}
-  cancel-in-progress: false
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    concurrency:
+      group: scrape-${{ matrix.niche_slug }}
+      cancel-in-progress: false
+    env:
+      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      SECRET: ${{ secrets.SECRET }}
+      PROXY_URL: ${{ secrets.PROXY_URL }}
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +47,7 @@ jobs:
           scrapling install
       - name: Scrape
         run: |
-          TARGET="${{ github.event.inputs.daily_target || '1000' }}"
+          TARGET="${{ github.event.inputs.daily_target || (github.event_name == 'push' && '40') || '1000' }}"
           START=""
           if [ -f "cursor_${{ matrix.niche_slug }}.txt" ]; then START="--start-index $(cat cursor_${{ matrix.niche_slug }}.txt)"; fi
           eval python -u gmb_scraper.py ${{ matrix.args }} --daily-target "$TARGET" $START 2>&1 | tee scrape_${{ matrix.niche_slug }}.log

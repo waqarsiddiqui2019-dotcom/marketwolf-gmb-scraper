@@ -43,6 +43,7 @@ Known limitations (accepted risk, discussed with the client):
 
 import argparse
 import asyncio
+import os
 import re
 import sys
 
@@ -52,8 +53,20 @@ from scrapling.fetchers import AsyncStealthySession
 from locations import build_priority_queries, build_queries, GENERAL_FALLBACK_TERM
 from email_finder import find_email
 
-WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwFx_9J6geeA38SMdF5QFZ4jbkZzRzKIZ-00cELpARAbhXE3k6mP4z66H_z52QEgKV8/exec"
-SECRET = "marketwolf-leads-2026"
+def _cfg(name):
+    """Config from env (GitHub Actions secrets) or the git-ignored secrets.local.json."""
+    v = os.environ.get(name)
+    if v:
+        return v
+    try:
+        import json as _j
+        return _j.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "secrets.local.json")))[name]
+    except Exception:
+        sys.exit(f"Missing config {name}: set the env var or create secrets.local.json")
+
+
+WEBHOOK_URL = _cfg("WEBHOOK_URL")
+SECRET = _cfg("SECRET")
 
 # Google's result-list cards never include the listing's real pincode (only
 # the full detail page does), so without this every lead was tagged with
@@ -160,7 +173,7 @@ def split_category_address(category_address: str):
 async def fetch_existing_phones() -> set:
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            resp = await client.get(WEBHOOK_URL, params={"secret": SECRET}, timeout=15.0)
+            resp = await client.get(WEBHOOK_URL, params={"secret": SECRET}, timeout=90.0)
             data = resp.json()
             phones = data.get("phones", [])
             return {normalize_phone(p) for p in phones if normalize_phone(p)}
@@ -430,14 +443,32 @@ async def main():
         # CAPTCHA/"unusual traffic" wall in the first place. max_pages=1 since
         # queries are still run one at a time, matching the old single-page
         # behaviour the resume cursor / politeness delay assume.
-        async with AsyncStealthySession(
-            headless=True,
-            max_pages=1,
-            block_webrtc=True,
-            useragent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            locale="en-IN",
-            extra_flags=["--disable-gpu", "--disable-dev-shm-usage"],
-        ) as session:
+        # PROXY_URL (e.g. http://user:pass@host:port) routes every request through a
+        # rotating residential/ISP proxy so GitHub's datacenter IPs are never what
+        # Google sees. With a rotating proxy a fresh session = a fresh IP, so a
+        # block is handled by rebuilding the session and retrying the same search
+        # (up to MAX_BLOCK_RETRIES in a row) instead of ending the whole night's run.
+        proxy_url = os.environ.get("PROXY_URL", "").strip()
+        MAX_BLOCK_RETRIES = int(os.environ.get("MAX_BLOCK_RETRIES", "4" if proxy_url else "0"))
+
+        def make_session():
+            kwargs = dict(
+                headless=True,
+                max_pages=1,
+                block_webrtc=True,
+                useragent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                locale="en-IN",
+                extra_flags=["--disable-gpu", "--disable-dev-shm-usage"],
+            )
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+                kwargs["disable_resources"] = True  # images/fonts/media off: saves proxy bandwidth
+            return AsyncStealthySession(**kwargs)
+
+        session_cm = make_session()
+        session = await session_cm.__aenter__()
+        block_streak = 0
+        try:
             # Bounded by len(grid) so a niche that's fully out of new
             # leads (everything already scraped) can't spin forever -
             # one full lap without hitting the target just ends the run.
@@ -449,11 +480,24 @@ async def main():
                 try:
                     new_count = await scrape_query(session, city, pincode, term, query, args.niche, seen_phones, http_client)
                     total_new += new_count
+                    block_streak = 0
                 except RuntimeError as e:
                     if str(e) == "BLOCKED_BY_GOOGLE":
-                        print("\nStopping entire run - Google has blocked this session.")
-                        blocked = True
-                        break
+                        block_streak += 1
+                        if block_streak > MAX_BLOCK_RETRIES:
+                            print("Stopping entire run - Google has blocked this session.")
+                            blocked = True
+                            break
+                        wait = 20 * block_streak
+                        print(f"  ~ blocked ({block_streak}/{MAX_BLOCK_RETRIES}); new session in {wait}s and retrying this search")
+                        try:
+                            await session_cm.__aexit__(None, None, None)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(wait)
+                        session_cm = make_session()
+                        session = await session_cm.__aenter__()
+                        continue
                     raise
 
                 cursor = (cursor + 1) % len(grid)
@@ -465,6 +509,11 @@ async def main():
                 except Exception as e:
                     print(f"  ! could not write local cursor file: {e}", file=sys.stderr)
                 await asyncio.sleep(2.5)  # be a little polite between queries
+        finally:
+            try:
+                await session_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
 
     if total_new > 0:
         await sort_sheet_by_location()
